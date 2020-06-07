@@ -241,45 +241,43 @@ fn get_code_from_example(ex: &str) -> String {
 
 #[cfg(test)]
 mod test {
-
   use super::*;
-
-  static SAMPLE1: &str = r#"/**
-  * 
-  * @param list - LinkedList<T>
-  * @example <caption>Linkedlists.compareWith</caption>
-  * ```ts
-  * import { LinkedList } from './js_test/linkedlist.ts'
-  * const testArr = [1, 2, 3, 4, 5, 6, 78, 9, 0, 65];
-  * const firstList = new LinkedList<number>();
-  * const secondList = new LinkedList<number>();
-  * for (let data of testArr) {
-  *   firstList.insertNode(data);
-  *   secondList.insertNode(data);
-  * }
-  * const result = firstList.compareWith(secondList);
-  * assert(result);
-  * ```
-  * @returns boolean
-  */
-   compareWith(list: LinkedList<T>): boolean {
-     let current1 = this.head;
-     let current2 = list.head;
-     while (current1 && current2) {
-       if (current1.data !== current2.data) return false;
-       if (current1.next && !current2.next && !current1.next && current2.next) {
-         return false;
-       }
-       current1 = current1.next;
-       current2 = current2.next;
-     }
-     return true;
-   }"#;
 
   #[test]
   fn test_extract_jsdoc() {
+    let test = r#"/**
+    * 
+    * @param list - LinkedList<T>
+    * @example <caption>Linkedlists.compareWith</caption>
+    * ```ts
+    * import { LinkedList } from './js_test/linkedlist.ts'
+    * const testArr = [1, 2, 3, 4, 5, 6, 78, 9, 0, 65];
+    * const firstList = new LinkedList<number>();
+    * const secondList = new LinkedList<number>();
+    * for (let data of testArr) {
+    *   firstList.insertNode(data);
+    *   secondList.insertNode(data);
+    * }
+    * const result = firstList.compareWith(secondList);
+    * assert(result);
+    * ```
+    * @returns boolean
+    */
+     compareWith(list: LinkedList<T>): boolean {
+       let current1 = this.head;
+       let current2 = list.head;
+       while (current1 && current2) {
+         if (current1.data !== current2.data) return false;
+         if (current1.next && !current2.next && !current1.next && current2.next) {
+           return false;
+         }
+         current1 = current1.next;
+         current2 = current2.next;
+       }
+       return true;
+     }"#;
     let res =
-      extract_jsdoc_examples(SAMPLE1.to_string(), PathBuf::from("user"));
+      extract_jsdoc_examples(test.to_string(), PathBuf::from("user"));
     assert!(res.is_some());
 
     let doctest = res.unwrap();
@@ -307,62 +305,137 @@ mod test {
     )
   }
 
-  static SAMPLE2: &str = r#"  /**
-   * 
-   * @param fn - (data: T, index: number) => T
-   * @example <caption>Linkedlist.map</caption>
-   * ```ts
-   * import { LinkedList } from './js_test/linkedlist.ts'
-   * const testArr = [1, 2, 3, 4, 5, 6, 78, 9, 0, 65];
-   * const testList = new LinkedList<number>();
-   * for (let data of testArr) {
-   *  testList.insertNode(data);
-   * }
-   * testList.map((c: number) => c ** 2);
-   * testList.forEach((c: number, i: number) => assertEquals(c, testArr[i] ** 2));
-   * ```
-   * 
-   * @example <caption>Linkedlist.map 2</caption>
-   * ```ts
-   * import { LinkedList } from './js_test/linkedlist.ts'
-   * const testArr = [1, 2, 3, 4, 5];
-   * const testList = new LinkedList<number>();
-   * for (let data of testArr) {
-   *  testList.insertNode(data);
-   * }
-   * testList.map((c: number) => c ** 2);
-   * testList.forEach((c: number, i: number) => assertEquals(c, testArr[i] ** 2));
-   * ```
-   */"#;
+  #[test]
+  fn test_multiple_examples() {
+    let test = r#"  /**
+    * 
+    * @param fn - (data: T, index: number) => T
+    * @example <caption>Linkedlist.map</caption>
+    * ```ts
+    * import { LinkedList } from './js_test/linkedlist.ts'
+    * const testArr = [1, 2, 3, 4, 5, 6, 78, 9, 0, 65];
+    * const testList = new LinkedList<number>();
+    * for (let data of testArr) {
+    *  testList.insertNode(data);
+    * }
+    * testList.map((c: number) => c ** 2);
+    * testList.forEach((c: number, i: number) => assertEquals(c, testArr[i] ** 2));
+    * ```
+    * 
+    * @example <caption>Linkedlist.map 2</caption>
+    * ```ignore
+    * import { LinkedList } from './js_test/linkedlist.ts'
+    * const testArr = [1, 2, 3, 4, 5];
+    * const testList = new LinkedList<number>();
+    * for (let data of testArr) {
+    *  testList.insertNode(data);
+    * }
+    * testList.map((c: number) => c ** 2);
+    * testList.forEach((c: number, i: number) => assertEquals(c, testArr[i] ** 2));
+    * ```
+    */"#;
+    let res =
+      extract_jsdoc_examples(test.to_string(), PathBuf::from("user"));
+    assert!(res.is_some());
 
-  static SAMPLE3: &str = r#"class Node<T> {
-    constructor(public data: T, public next?: Node<T>) {}
-  
-    swap(other: Node<T>) {
-      let temp = this.data;
-      this.data = other.data;
-      other.data = temp;
-    }
-  }"#;
-
-  static SAMPLE4: &str = r#"* @example <caption>Linkedlist.compareWith</caption>
-  * ```
-  * import { LinkedLists } from './js_test/nested/linkedlist.ts'
-  * const testArr = [1, 2, 3, 4, 5, 6, 78, 9, 0, 65];
-  * const firstList = new LinkedLists<number>();
-  * const secondList = new LinkedLists<number>();
-  * for (let data of testArr) {
-  *   firstList.insertNode(data);
-  *   secondList.insertNode(data);
-  * }
-  * const result = await firstList.compareWith(secondList);
-  * assert(result);
-  * ```"#;
+    let doctest = res.unwrap();
+    // imports are deduped
+    assert_eq!(1, *&doctest.imports.len());
+    assert_eq!(*&doctest.bodies.len(), 2);
+    let body1 = &doctest.bodies[0];
+    let body2 = &doctest.bodies[1];
+    assert!(!body1.is_async);
+    assert!(!body2.is_async);
+    assert!(!body1.ignore);
+    assert!(body2.ignore);
+    assert_eq!(body1.caption, "Linkedlist.map".to_string());
+    assert_eq!(body2.caption, "Linkedlist.map 2".to_string());
+    assert_eq!(body1.line_number, 5);
+    assert_eq!(body2.line_number, 17);
+    assert_eq!(
+      body2.value,
+      vec![
+        "  const testArr = [1, 2, 3, 4, 5];",
+        "  const testList = new LinkedList<number>();",
+        "  for (let data of testArr) {",
+        "  testList.insertNode(data);",
+        "  }",
+        "  testList.map((c: number) => c ** 2);",
+        "  testList.forEach((c: number, i: number) => assertEquals(c, testArr[i] ** 2));"
+      ]
+      .join("\n")
+    );
+    assert_eq!(
+      body1.value, 
+      vec![
+        "  const testArr = [1, 2, 3, 4, 5, 6, 78, 9, 0, 65];",
+        "  const testList = new LinkedList<number>();",
+        "  for (let data of testArr) {",
+        "  testList.insertNode(data);",
+        "  }",
+        "  testList.map((c: number) => c ** 2);",
+        "  testList.forEach((c: number, i: number) => assertEquals(c, testArr[i] ** 2));",
+  ].join("\n"));
+  }
 
   #[test]
-  fn happy() {
-    assert!(SAMPLE2.len() > 1);
-    assert!(SAMPLE3.len() > 1);
-    assert!(SAMPLE4.len() > 1);
+  fn test_code_without_jsdoc() {
+    let test = r#"class Node<T> {
+      constructor(public data: T, public next?: Node<T>) {}
+    
+      swap(other: Node<T>) {
+        let temp = this.data;
+        this.data = other.data;
+        other.data = temp;
+      }
+    }"#;
+    let res = extract_jsdoc_examples(test.to_string(), PathBuf::from("user"));
+    assert!(res.is_none());
+  }
+
+  #[test]
+  fn test_async_detection() {
+    let test = r#"  /**
+    * @example
+    * ```ts
+    * const response = await fetch("https://deno.land");
+    * const body = await response.text();
+    * assert(body.length > 0);
+    * ```
+    */"#;
+
+    let res = extract_jsdoc_examples(test.to_string(), PathBuf::from("user"));
+    assert!(res.is_some());
+    let doctest = res.unwrap();
+    let body = &doctest.bodies[0];
+    assert!(body.is_async);
+  }
+
+  #[test]
+  fn test_text_tag() {
+    let test = r#"  /**
+    * @example
+    * ```text
+    * const response = await fetch("https://deno.land");
+    * const body = await response.text();
+    * assert(body.length > 0);
+    * ```
+    */"#;
+
+    let res = extract_jsdoc_examples(test.to_string(), PathBuf::from("user"));
+    assert!(res.is_none());
+  }
+
+  #[test]
+  fn test_jump_example_without_backticks() {
+    let test = r#"  /**
+    * @example
+    * const response = await fetch("https://deno.land");
+    * const body = await response.text();
+    * assert(body.length > 0);
+    */"#;
+
+    let res = extract_jsdoc_examples(test.to_string(), PathBuf::from("user"));
+    assert!(res.is_none());
   }
 }
