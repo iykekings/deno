@@ -276,8 +276,7 @@ mod test {
        }
        return true;
      }"#;
-    let res =
-      extract_jsdoc_examples(test.to_string(), PathBuf::from("user"));
+    let res = extract_jsdoc_examples(test.to_string(), PathBuf::from("user"));
     assert!(res.is_some());
 
     let doctest = res.unwrap();
@@ -334,8 +333,7 @@ mod test {
     * testList.forEach((c: number, i: number) => assertEquals(c, testArr[i] ** 2));
     * ```
     */"#;
-    let res =
-      extract_jsdoc_examples(test.to_string(), PathBuf::from("user"));
+    let res = extract_jsdoc_examples(test.to_string(), PathBuf::from("user"));
     assert!(res.is_some());
 
     let doctest = res.unwrap();
@@ -366,7 +364,7 @@ mod test {
       .join("\n")
     );
     assert_eq!(
-      body1.value, 
+      body1.value,
       vec![
         "  const testArr = [1, 2, 3, 4, 5, 6, 78, 9, 0, 65];",
         "  const testList = new LinkedList<number>();",
