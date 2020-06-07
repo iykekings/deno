@@ -238,3 +238,131 @@ fn get_code_from_example(ex: &str) -> String {
     .collect::<Vec<_>>()
     .join("\n")
 }
+
+#[cfg(test)]
+mod test {
+
+  use super::*;
+
+  static SAMPLE1: &str = r#"/**
+  * 
+  * @param list - LinkedList<T>
+  * @example <caption>Linkedlists.compareWith</caption>
+  * ```ts
+  * import { LinkedList } from './js_test/linkedlist.ts'
+  * const testArr = [1, 2, 3, 4, 5, 6, 78, 9, 0, 65];
+  * const firstList = new LinkedList<number>();
+  * const secondList = new LinkedList<number>();
+  * for (let data of testArr) {
+  *   firstList.insertNode(data);
+  *   secondList.insertNode(data);
+  * }
+  * const result = firstList.compareWith(secondList);
+  * assert(result);
+  * ```
+  * @returns boolean
+  */
+   compareWith(list: LinkedList<T>): boolean {
+     let current1 = this.head;
+     let current2 = list.head;
+     while (current1 && current2) {
+       if (current1.data !== current2.data) return false;
+       if (current1.next && !current2.next && !current1.next && current2.next) {
+         return false;
+       }
+       current1 = current1.next;
+       current2 = current2.next;
+     }
+     return true;
+   }"#;
+
+  #[test]
+  fn test_extract_jsdoc() {
+    let res =
+      extract_jsdoc_examples(SAMPLE1.to_string(), PathBuf::from("user"));
+    assert!(res.is_some());
+
+    let doctest = res.unwrap();
+    assert_eq!(1, *&doctest.imports.len());
+    assert_eq!(*&doctest.bodies.len(), 1);
+    let body = &doctest.bodies[0];
+    assert!(!body.is_async);
+    assert!(!body.ignore);
+    assert_eq!(body.caption, "Linkedlists.compareWith".to_string());
+    assert_eq!(body.line_number, 5);
+    assert_eq!(
+      body.value,
+      vec![
+        "  const testArr = [1, 2, 3, 4, 5, 6, 78, 9, 0, 65];",
+        "  const firstList = new LinkedList<number>();",
+        "  const secondList = new LinkedList<number>();",
+        "  for (let data of testArr) {",
+        "  firstList.insertNode(data);",
+        "  secondList.insertNode(data);",
+        "  }",
+        "  const result = firstList.compareWith(secondList);",
+        "  assert(result);"
+      ]
+      .join("\n")
+    )
+  }
+
+  static SAMPLE2: &str = r#"  /**
+   * 
+   * @param fn - (data: T, index: number) => T
+   * @example <caption>Linkedlist.map</caption>
+   * ```ts
+   * import { LinkedList } from './js_test/linkedlist.ts'
+   * const testArr = [1, 2, 3, 4, 5, 6, 78, 9, 0, 65];
+   * const testList = new LinkedList<number>();
+   * for (let data of testArr) {
+   *  testList.insertNode(data);
+   * }
+   * testList.map((c: number) => c ** 2);
+   * testList.forEach((c: number, i: number) => assertEquals(c, testArr[i] ** 2));
+   * ```
+   * 
+   * @example <caption>Linkedlist.map 2</caption>
+   * ```ts
+   * import { LinkedList } from './js_test/linkedlist.ts'
+   * const testArr = [1, 2, 3, 4, 5];
+   * const testList = new LinkedList<number>();
+   * for (let data of testArr) {
+   *  testList.insertNode(data);
+   * }
+   * testList.map((c: number) => c ** 2);
+   * testList.forEach((c: number, i: number) => assertEquals(c, testArr[i] ** 2));
+   * ```
+   */"#;
+
+  static SAMPLE3: &str = r#"class Node<T> {
+    constructor(public data: T, public next?: Node<T>) {}
+  
+    swap(other: Node<T>) {
+      let temp = this.data;
+      this.data = other.data;
+      other.data = temp;
+    }
+  }"#;
+
+  static SAMPLE4: &str = r#"* @example <caption>Linkedlist.compareWith</caption>
+  * ```
+  * import { LinkedLists } from './js_test/nested/linkedlist.ts'
+  * const testArr = [1, 2, 3, 4, 5, 6, 78, 9, 0, 65];
+  * const firstList = new LinkedLists<number>();
+  * const secondList = new LinkedLists<number>();
+  * for (let data of testArr) {
+  *   firstList.insertNode(data);
+  *   secondList.insertNode(data);
+  * }
+  * const result = await firstList.compareWith(secondList);
+  * assert(result);
+  * ```"#;
+
+  #[test]
+  fn happy() {
+    assert!(SAMPLE2.len() > 1);
+    assert!(SAMPLE3.len() > 1);
+    assert!(SAMPLE4.len() > 1);
+  }
+}
