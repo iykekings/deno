@@ -68,6 +68,7 @@ pub use dprint_plugin_typescript::swc_common;
 pub use dprint_plugin_typescript::swc_ecma_ast;
 pub use dprint_plugin_typescript::swc_ecma_parser;
 
+use crate::doc::parser::default_docloader;
 use crate::doc::parser::DocFileLoader;
 use crate::file_fetcher::SourceFile;
 use crate::file_fetcher::SourceFileFetcher;
@@ -123,6 +124,27 @@ impl log::Log for Logger {
     }
   }
   fn flush(&self) {}
+}
+
+impl DocFileLoader for SourceFileFetcher {
+  fn load_source_code(
+    &self,
+    specifier: &str,
+  ) -> Pin<Box<dyn Future<Output = Result<String, OpError>>>> {
+    default_docloader(self, specifier)
+    // let specifier =
+    //   ModuleSpecifier::resolve_url_or_path(specifier).expect("Bad specifier");
+    // let fetcher = self.clone();
+
+    // async move {
+    //   let source_file = fetcher
+    //     .fetch_source_file(&specifier, None, Permissions::allow_all())
+    //     .await?;
+    //   String::from_utf8(source_file.source_code)
+    //     .map_err(|_| OpError::other("failed to parse".to_string()))
+    // }
+    // .boxed_local()
+  }
 }
 
 fn write_to_stdout_ignore_sigpipe(bytes: &[u8]) -> Result<(), std::io::Error> {
@@ -458,26 +480,6 @@ async fn doc_command(
   let global_state = GlobalState::new(flags.clone())?;
   let source_file = source_file.unwrap_or_else(|| "--builtin".to_string());
 
-  impl DocFileLoader for SourceFileFetcher {
-    fn load_source_code(
-      &self,
-      specifier: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, OpError>>>> {
-      let specifier =
-        ModuleSpecifier::resolve_url_or_path(specifier).expect("Bad specifier");
-      let fetcher = self.clone();
-
-      async move {
-        let source_file = fetcher
-          .fetch_source_file(&specifier, None, Permissions::allow_all())
-          .await?;
-        String::from_utf8(source_file.source_code)
-          .map_err(|_| OpError::other("failed to parse".to_string()))
-      }
-      .boxed_local()
-    }
-  }
-
   let loader = Box::new(global_state.file_fetcher.clone());
   let doc_parser = doc::DocParser::new(loader);
 
@@ -555,35 +557,35 @@ async fn test_command(
   let global_state = GlobalState::new(flags.clone())?;
   let cwd = std::env::current_dir().expect("No current directory");
   let include = include.unwrap_or_else(|| vec![".".to_string()]);
-
-  let (test_file, is_empty) = if !docs {
-    let test_modules = test_runner::prepare_test_modules_urls(include, &cwd)?;
-    let empty = &test_modules.is_empty();
-    (
-      test_runner::render_test_file(test_modules, fail_fast, quiet, filter),
-      *empty,
-    )
+  let filter_fn = if !docs {
+    test_runner::is_supported
   } else {
-    let doctest_modules = doctest_runner::prepare_doctests(include, &cwd);
-    let empty = &doctest_modules.is_empty();
-    (
-      doctest_runner::render_doctest_file(
-        doctest_modules,
-        fail_fast,
-        quiet,
-        filter,
-      ),
-      *empty,
-    )
+    doctest_runner::is_supported
   };
 
-  if is_empty {
+  let test_modules =
+    test_runner::prepare_test_modules_urls(include, &cwd, filter_fn)?;
+
+  if test_modules.is_empty() {
     println!("No matching test modules found");
     if !allow_none {
       std::process::exit(1);
     }
     return Ok(());
   }
+
+  let test_file = if !docs {
+    test_runner::render_test_file(test_modules, fail_fast, quiet, filter)
+  } else {
+    doctest_runner::prepare_doctests_new(
+      test_modules,
+      flags,
+      fail_fast,
+      quiet,
+      filter,
+    )
+    .await?
+  };
 
   let test_file_path = cwd.join(".deno.test.ts");
   let test_file_url =

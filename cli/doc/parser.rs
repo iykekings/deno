@@ -1,6 +1,8 @@
 // Copyright 2018-2020 the Deno authors. All rights reserved. MIT license.
 use crate::file_fetcher::map_file_extension;
+use crate::file_fetcher::SourceFileFetcher;
 use crate::op_error::OpError;
+use crate::permissions::Permissions;
 use crate::swc_common::comments::CommentKind;
 use crate::swc_common::Span;
 use crate::swc_ecma_ast;
@@ -44,6 +46,23 @@ pub trait DocFileLoader {
 pub struct DocParser {
   pub ast_parser: AstParser,
   pub loader: Box<dyn DocFileLoader>,
+}
+
+pub fn default_docloader(
+  fetcher: &SourceFileFetcher,
+  specifier: &str,
+) -> Pin<Box<dyn Future<Output = Result<String, OpError>>>> {
+  let specifier =
+    ModuleSpecifier::resolve_url_or_path(specifier).expect("Bad specifier");
+  let fetcher = fetcher.clone();
+
+  Box::pin(async move {
+    let source_file = fetcher
+      .fetch_source_file(&specifier, None, Permissions::allow_all())
+      .await?;
+    String::from_utf8(source_file.source_code)
+      .map_err(|_| OpError::other("failed to parse".to_string()))
+  })
 }
 
 impl DocParser {
