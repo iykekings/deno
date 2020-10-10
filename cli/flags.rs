@@ -1168,6 +1168,7 @@ fn test_subcommand<'a, 'b>() -> App<'a, 'b> {
       Arg::with_name("docs")
         .long("docs")
         .help("Run code examples from JSDocs as tests")
+        .requires("unstable")
         .takes_value(false),
     )
     .arg(
@@ -2907,7 +2908,6 @@ mod tests {
           quiet: false,
           filter: None,
           include: Some(svec!["dir1"]),
-          coverage: false
         },
         ..Flags::default()
       }
