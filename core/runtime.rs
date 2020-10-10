@@ -35,8 +35,6 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::ffi::c_void;
 use std::mem::forget;
-use std::ops::Deref;
-use std::ops::DerefMut;
 use std::option::Option;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -108,19 +106,6 @@ pub(crate) struct JsRuntimeState {
   waker: AtomicWaker,
 }
 
-impl Deref for JsRuntime {
-  type Target = v8::Isolate;
-  fn deref(&self) -> &v8::Isolate {
-    self.v8_isolate.as_ref().unwrap()
-  }
-}
-
-impl DerefMut for JsRuntime {
-  fn deref_mut(&mut self) -> &mut v8::Isolate {
-    self.v8_isolate.as_mut().unwrap()
-  }
-}
-
 impl Drop for JsRuntime {
   fn drop(&mut self) {
     if let Some(creator) = self.snapshot_creator.take() {
@@ -157,7 +142,6 @@ pub unsafe fn v8_init() {
     "--wasm-test-streaming".to_string(),
     "--no-wasm-async-compilation".to_string(),
     "--harmony-top-level-await".to_string(),
-    "--experimental-wasm-bigint".to_string(),
   ];
   v8::V8::set_flags_from_command_line(argv);
 }
@@ -305,10 +289,14 @@ impl JsRuntime {
     }
   }
 
-  pub fn global_context(&self) -> v8::Global<v8::Context> {
-    let state = Self::state(self);
+  pub fn global_context(&mut self) -> v8::Global<v8::Context> {
+    let state = Self::state(self.v8_isolate());
     let state = state.borrow();
     state.global_context.clone().unwrap()
+  }
+
+  pub fn v8_isolate(&mut self) -> &mut v8::OwnedIsolate {
+    self.v8_isolate.as_mut().unwrap()
   }
 
   fn setup_isolate(mut isolate: v8::OwnedIsolate) -> v8::OwnedIsolate {
@@ -329,15 +317,15 @@ impl JsRuntime {
   }
 
   /// Executes a bit of built-in JavaScript to provide Deno.sharedQueue.
-  pub(crate) fn shared_init(&mut self) {
+  fn shared_init(&mut self) {
     if self.needs_init {
       self.needs_init = false;
-      js_check(self.execute("core.js", include_str!("core.js")));
+      self.execute("core.js", include_str!("core.js")).unwrap();
     }
   }
 
   pub fn op_state(&mut self) -> Rc<RefCell<OpState>> {
-    let state_rc = Self::state(self);
+    let state_rc = Self::state(self.v8_isolate());
     let state = state_rc.borrow();
     state.op_state.clone()
   }
@@ -354,15 +342,9 @@ impl JsRuntime {
   ) -> Result<(), AnyError> {
     self.shared_init();
 
-    let state_rc = Self::state(self);
-    let state = state_rc.borrow();
+    let context = self.global_context();
 
-    let scope = &mut v8::HandleScope::with_context(
-      self.v8_isolate.as_mut().unwrap(),
-      state.global_context.as_ref().unwrap(),
-    );
-
-    drop(state);
+    let scope = &mut v8::HandleScope::with_context(self.v8_isolate(), context);
 
     let source = v8::String::new(scope, js_source).unwrap();
     let name = v8::String::new(scope, js_filename).unwrap();
@@ -396,7 +378,7 @@ impl JsRuntime {
   /// be a different type if `RuntimeOptions::js_error_create_fn` has been set.
   pub fn snapshot(&mut self) -> v8::StartupData {
     assert!(self.snapshot_creator.is_some());
-    let state = Self::state(self);
+    let state = Self::state(self.v8_isolate());
 
     // Note: create_blob() method must not be called from within a HandleScope.
     // TODO(piscisaureus): The rusty_v8 type system should enforce this.
@@ -417,7 +399,7 @@ impl JsRuntime {
   where
     F: Fn(Rc<RefCell<OpState>>, BufVec) -> Op + 'static,
   {
-    Self::state(self)
+    Self::state(self.v8_isolate())
       .borrow_mut()
       .op_state
       .borrow_mut()
@@ -443,16 +425,12 @@ impl JsRuntime {
       .replace((boxed_cb, near_heap_limit_callback::<C>));
     if let Some((_, prev_cb)) = prev {
       self
-        .v8_isolate
-        .as_mut()
-        .unwrap()
+        .v8_isolate()
         .remove_near_heap_limit_callback(prev_cb, 0);
     }
 
     self
-      .v8_isolate
-      .as_mut()
-      .unwrap()
+      .v8_isolate()
       .add_near_heap_limit_callback(near_heap_limit_callback::<C>, data);
   }
 
@@ -460,9 +438,7 @@ impl JsRuntime {
     if let Some((_, cb)) = self.allocations.near_heap_limit_callback_data.take()
     {
       self
-        .v8_isolate
-        .as_mut()
-        .unwrap()
+        .v8_isolate()
         .remove_near_heap_limit_callback(cb, heap_limit);
     }
   }
@@ -487,115 +463,49 @@ impl Future for JsRuntime {
     let runtime = self.get_mut();
     runtime.shared_init();
 
-    let state_rc = Self::state(runtime);
+    let state_rc = Self::state(runtime.v8_isolate());
     {
       let state = state_rc.borrow();
       state.waker.register(cx.waker());
     }
 
-    let has_preparing = {
-      let state = state_rc.borrow();
-      !state.preparing_dyn_imports.is_empty()
-    };
-    if has_preparing {
+    // Dynamic module loading - ie. modules loaded using "import()"
+    {
       let poll_imports = runtime.prepare_dyn_imports(cx)?;
       assert!(poll_imports.is_ready());
-    }
 
-    let has_pending = {
-      let state = state_rc.borrow();
-      !state.pending_dyn_imports.is_empty()
-    };
-    if has_pending {
       let poll_imports = runtime.poll_dyn_imports(cx)?;
       assert!(poll_imports.is_ready());
+
+      runtime.check_promise_exceptions()?;
     }
 
-    let scope = &mut v8::HandleScope::with_context(
-      &mut **runtime,
-      state_rc.borrow().global_context.as_ref().unwrap(),
-    );
-
-    check_promise_exceptions(scope)?;
-
-    let mut overflow_response: Option<(OpId, Box<[u8]>)> = None;
-
-    loop {
-      let mut state = state_rc.borrow_mut();
-      // Now handle actual ops.
-      state.have_unpolled_ops.set(false);
-
-      let pending_r = state.pending_ops.poll_next_unpin(cx);
-      match pending_r {
-        Poll::Ready(None) => break,
-        Poll::Pending => break,
-        Poll::Ready(Some((op_id, buf))) => {
-          let successful_push = state.shared.push(op_id, &buf);
-          if !successful_push {
-            // If we couldn't push the response to the shared queue, because
-            // there wasn't enough size, we will return the buffer via the
-            // legacy route, using the argument of deno_respond.
-            overflow_response = Some((op_id, buf));
-            break;
-          }
-        }
-      };
-    }
-
-    loop {
-      let mut state = state_rc.borrow_mut();
-      let unref_r = state.pending_unref_ops.poll_next_unpin(cx);
-      #[allow(clippy::match_wild_err_arm)]
-      match unref_r {
-        Poll::Ready(None) => break,
-        Poll::Pending => break,
-        Poll::Ready(Some((op_id, buf))) => {
-          let successful_push = state.shared.push(op_id, &buf);
-          if !successful_push {
-            // If we couldn't push the response to the shared queue, because
-            // there wasn't enough size, we will return the buffer via the
-            // legacy route, using the argument of deno_respond.
-            overflow_response = Some((op_id, buf));
-            break;
-          }
-        }
-      };
-    }
-
+    // Ops
     {
-      let state = state_rc.borrow();
-      if state.shared.size() > 0 {
-        drop(state);
-        async_op_response(scope, None)?;
-        // The other side should have shifted off all the messages.
-        let state = state_rc.borrow();
-        assert_eq!(state.shared.size(), 0);
-      }
-    }
-
-    {
-      if let Some((op_id, buf)) = overflow_response.take() {
-        async_op_response(scope, Some((op_id, buf)))?;
-      }
-
-      drain_macrotasks(scope)?;
-
-      check_promise_exceptions(scope)?;
+      let overflow_response = runtime.poll_pending_ops(cx);
+      runtime.async_op_response(overflow_response)?;
+      runtime.drain_macrotasks()?;
+      runtime.check_promise_exceptions()?;
     }
 
     let state = state_rc.borrow();
-    // We're idle if pending_ops is empty.
-    if state.pending_ops.is_empty()
-      && state.pending_dyn_imports.is_empty()
-      && state.preparing_dyn_imports.is_empty()
-    {
-      Poll::Ready(Ok(()))
-    } else {
-      if state.have_unpolled_ops.get() {
-        state.waker.wake();
-      }
-      Poll::Pending
+    let is_idle = {
+      state.pending_ops.is_empty()
+        && state.pending_dyn_imports.is_empty()
+        && state.preparing_dyn_imports.is_empty()
+    };
+
+    if is_idle {
+      return Poll::Ready(Ok(()));
     }
+
+    // Check if more async ops have been dispatched
+    // during this turn of event loop.
+    if state.have_unpolled_ops.get() {
+      state.waker.wake();
+    }
+
+    Poll::Pending
   }
 }
 
@@ -609,7 +519,7 @@ impl JsRuntimeState {
     let referrer = self.modules.get_name(referrer_id).unwrap();
     let specifier = self
       .loader
-      .resolve(specifier, referrer, false)
+      .resolve(self.op_state.clone(), specifier, referrer, false)
       .expect("Module should have been already resolved");
     self.modules.get_id(specifier.as_str()).unwrap_or(0)
   }
@@ -634,74 +544,6 @@ impl JsRuntimeState {
     let fut = load.prepare().boxed_local();
     self.preparing_dyn_imports.push(fut);
   }
-}
-
-fn async_op_response<'s>(
-  scope: &mut v8::HandleScope<'s>,
-  maybe_buf: Option<(OpId, Box<[u8]>)>,
-) -> Result<(), AnyError> {
-  let context = scope.get_current_context();
-  let global: v8::Local<v8::Value> = context.global(scope).into();
-  let js_recv_cb = JsRuntime::state(scope)
-    .borrow()
-    .js_recv_cb
-    .as_ref()
-    .map(|cb| v8::Local::new(scope, cb))
-    .expect("Deno.core.recv has not been called.");
-
-  let tc_scope = &mut v8::TryCatch::new(scope);
-
-  match maybe_buf {
-    Some((op_id, buf)) => {
-      let op_id: v8::Local<v8::Value> =
-        v8::Integer::new(tc_scope, op_id as i32).into();
-      let ui8: v8::Local<v8::Value> =
-        boxed_slice_to_uint8array(tc_scope, buf).into();
-      js_recv_cb.call(tc_scope, global, &[op_id, ui8])
-    }
-    None => js_recv_cb.call(tc_scope, global, &[]),
-  };
-
-  match tc_scope.exception() {
-    None => Ok(()),
-    Some(exception) => exception_to_err_result(tc_scope, exception),
-  }
-}
-
-fn drain_macrotasks<'s>(
-  scope: &mut v8::HandleScope<'s>,
-) -> Result<(), AnyError> {
-  let context = scope.get_current_context();
-  let global: v8::Local<v8::Value> = context.global(scope).into();
-
-  let js_macrotask_cb = match JsRuntime::state(scope)
-    .borrow_mut()
-    .js_macrotask_cb
-    .as_ref()
-  {
-    Some(cb) => v8::Local::new(scope, cb),
-    None => return Ok(()),
-  };
-
-  // Repeatedly invoke macrotask callback until it returns true (done),
-  // such that ready microtasks would be automatically run before
-  // next macrotask is processed.
-  let tc_scope = &mut v8::TryCatch::new(scope);
-
-  loop {
-    let is_done = js_macrotask_cb.call(tc_scope, global, &[]);
-
-    if let Some(exception) = tc_scope.exception() {
-      return exception_to_err_result(tc_scope, exception);
-    }
-
-    let is_done = is_done.unwrap();
-    if is_done.is_true() {
-      break;
-    }
-  }
-
-  Ok(())
 }
 
 pub(crate) fn exception_to_err_result<'s, T>(
@@ -744,42 +586,6 @@ pub(crate) fn exception_to_err_result<'s, T>(
   Err(js_error)
 }
 
-fn check_promise_exceptions<'s>(
-  scope: &mut v8::HandleScope<'s>,
-) -> Result<(), AnyError> {
-  let state_rc = JsRuntime::state(scope);
-  let mut state = state_rc.borrow_mut();
-
-  if let Some(&key) = state.pending_promise_exceptions.keys().next() {
-    let handle = state.pending_promise_exceptions.remove(&key).unwrap();
-    drop(state);
-    let exception = v8::Local::new(scope, handle);
-    exception_to_err_result(scope, exception)
-  } else {
-    Ok(())
-  }
-}
-
-pub fn js_check<T>(r: Result<T, AnyError>) -> T {
-  if let Err(e) = r {
-    panic!(e.to_string());
-  }
-  r.unwrap()
-}
-
-fn boxed_slice_to_uint8array<'sc>(
-  scope: &mut v8::HandleScope<'sc>,
-  buf: Box<[u8]>,
-) -> v8::Local<'sc, v8::Uint8Array> {
-  assert!(!buf.is_empty());
-  let buf_len = buf.len();
-  let backing_store = v8::ArrayBuffer::new_backing_store_from_boxed_slice(buf);
-  let backing_store_shared = backing_store.make_shared();
-  let ab = v8::ArrayBuffer::with_backing_store(scope, &backing_store_shared);
-  v8::Uint8Array::new(scope, ab, 0, buf_len)
-    .expect("Failed to create UintArray8")
-}
-
 // Related to module loading
 impl JsRuntime {
   /// Low-level module creation.
@@ -791,11 +597,9 @@ impl JsRuntime {
     name: &str,
     source: &str,
   ) -> Result<ModuleId, AnyError> {
-    let state_rc = Self::state(self);
-    let scope = &mut v8::HandleScope::with_context(
-      &mut **self,
-      state_rc.borrow().global_context.as_ref().unwrap(),
-    );
+    let state_rc = Self::state(self.v8_isolate());
+    let context = self.global_context();
+    let scope = &mut v8::HandleScope::with_context(self.v8_isolate(), context);
 
     let name_str = v8::String::new(scope, name).unwrap();
     let source_str = v8::String::new(scope, source).unwrap();
@@ -821,8 +625,12 @@ impl JsRuntime {
       let import_specifier =
         module.get_module_request(i).to_rust_string_lossy(tc_scope);
       let state = state_rc.borrow();
-      let module_specifier =
-        state.loader.resolve(&import_specifier, name, false)?;
+      let module_specifier = state.loader.resolve(
+        state.op_state.clone(),
+        &import_specifier,
+        name,
+        false,
+      )?;
       import_specifiers.push(module_specifier);
     }
 
@@ -843,14 +651,13 @@ impl JsRuntime {
   /// about the V8 exception. By default this type is `JsError`, however it may
   /// be a different type if `RuntimeOptions::js_error_create_fn` has been set.
   fn mod_instantiate(&mut self, id: ModuleId) -> Result<(), AnyError> {
-    let state_rc = Self::state(self);
-    let state = state_rc.borrow();
-    let scope = &mut v8::HandleScope::with_context(
-      &mut **self,
-      state.global_context.as_ref().unwrap(),
-    );
+    let state_rc = Self::state(self.v8_isolate());
+    let context = self.global_context();
+
+    let scope = &mut v8::HandleScope::with_context(self.v8_isolate(), context);
     let tc_scope = &mut v8::TryCatch::new(scope);
 
+    let state = state_rc.borrow();
     let module = match state.modules.get_info(id) {
       Some(info) => v8::Local::new(tc_scope, &info.handle),
       None if id == 0 => return Ok(()),
@@ -881,12 +688,10 @@ impl JsRuntime {
   pub fn mod_evaluate(&mut self, id: ModuleId) -> Result<(), AnyError> {
     self.shared_init();
 
-    let state_rc = Self::state(self);
+    let state_rc = Self::state(self.v8_isolate());
+    let context = self.global_context();
 
-    let scope = &mut v8::HandleScope::with_context(
-      &mut **self,
-      state_rc.borrow().global_context.as_ref().unwrap(),
-    );
+    let scope = &mut v8::HandleScope::with_context(self.v8_isolate(), context);
 
     let module = state_rc
       .borrow()
@@ -949,12 +754,10 @@ impl JsRuntime {
     id: ModuleLoadId,
     err: AnyError,
   ) -> Result<(), AnyError> {
-    let state_rc = Self::state(self);
+    let state_rc = Self::state(self.v8_isolate());
+    let context = self.global_context();
 
-    let scope = &mut v8::HandleScope::with_context(
-      &mut **self,
-      state_rc.borrow().global_context.as_ref().unwrap(),
-    );
+    let scope = &mut v8::HandleScope::with_context(self.v8_isolate(), context);
 
     let resolver_handle = state_rc
       .borrow_mut()
@@ -982,14 +785,12 @@ impl JsRuntime {
     id: ModuleLoadId,
     mod_id: ModuleId,
   ) -> Result<(), AnyError> {
-    let state_rc = Self::state(self);
+    let state_rc = Self::state(self.v8_isolate());
+    let context = self.global_context();
 
     debug!("dyn_import_done {} {:?}", id, mod_id);
     assert!(mod_id != 0);
-    let scope = &mut v8::HandleScope::with_context(
-      &mut **self,
-      state_rc.borrow().global_context.as_ref().unwrap(),
-    );
+    let scope = &mut v8::HandleScope::with_context(self.v8_isolate(), context);
 
     let resolver_handle = state_rc
       .borrow_mut()
@@ -1019,7 +820,11 @@ impl JsRuntime {
     &mut self,
     cx: &mut Context,
   ) -> Poll<Result<(), AnyError>> {
-    let state_rc = Self::state(self);
+    let state_rc = Self::state(self.v8_isolate());
+
+    if state_rc.borrow().preparing_dyn_imports.is_empty() {
+      return Poll::Ready(Ok(()));
+    }
 
     loop {
       let r = {
@@ -1053,7 +858,12 @@ impl JsRuntime {
     &mut self,
     cx: &mut Context,
   ) -> Poll<Result<(), AnyError>> {
-    let state_rc = Self::state(self);
+    let state_rc = Self::state(self.v8_isolate());
+
+    if state_rc.borrow().pending_dyn_imports.is_empty() {
+      return Poll::Ready(Ok(()));
+    }
+
     loop {
       let poll_result = {
         let mut state = state_rc.borrow_mut();
@@ -1123,7 +933,7 @@ impl JsRuntime {
     let referrer_specifier =
       ModuleSpecifier::resolve_url(&module_url_found).unwrap();
 
-    let state_rc = Self::state(self);
+    let state_rc = Self::state(self.v8_isolate());
     // #A There are 3 cases to handle at this moment:
     // 1. Source code resolved result have the same module name as requested
     //    and is not yet registered
@@ -1162,14 +972,14 @@ impl JsRuntime {
 
     // Now we must iterate over all imports of the module and load them.
     let imports = {
-      let state_rc = Self::state(self);
+      let state_rc = Self::state(self.v8_isolate());
       let state = state_rc.borrow();
       state.modules.get_children(module_id).unwrap().clone()
     };
 
     for module_specifier in imports {
       let is_registered = {
-        let state_rc = Self::state(self);
+        let state_rc = Self::state(self.v8_isolate());
         let state = state_rc.borrow();
         state.modules.is_registered(&module_specifier)
       };
@@ -1203,7 +1013,7 @@ impl JsRuntime {
   ) -> Result<ModuleId, AnyError> {
     self.shared_init();
     let loader = {
-      let state_rc = Self::state(self);
+      let state_rc = Self::state(self.v8_isolate());
       let state = state_rc.borrow();
       state.loader.clone()
     };
@@ -1225,6 +1035,163 @@ impl JsRuntime {
 
     let root_id = load.root_module_id.expect("Root module id empty");
     self.mod_instantiate(root_id).map(|_| root_id)
+  }
+
+  fn poll_pending_ops(
+    &mut self,
+    cx: &mut Context,
+  ) -> Option<(OpId, Box<[u8]>)> {
+    let state_rc = Self::state(self.v8_isolate());
+    let mut overflow_response: Option<(OpId, Box<[u8]>)> = None;
+
+    loop {
+      let mut state = state_rc.borrow_mut();
+      // Now handle actual ops.
+      state.have_unpolled_ops.set(false);
+
+      let pending_r = state.pending_ops.poll_next_unpin(cx);
+      match pending_r {
+        Poll::Ready(None) => break,
+        Poll::Pending => break,
+        Poll::Ready(Some((op_id, buf))) => {
+          let successful_push = state.shared.push(op_id, &buf);
+          if !successful_push {
+            // If we couldn't push the response to the shared queue, because
+            // there wasn't enough size, we will return the buffer via the
+            // legacy route, using the argument of deno_respond.
+            overflow_response = Some((op_id, buf));
+            break;
+          }
+        }
+      };
+    }
+
+    loop {
+      let mut state = state_rc.borrow_mut();
+      let unref_r = state.pending_unref_ops.poll_next_unpin(cx);
+      #[allow(clippy::match_wild_err_arm)]
+      match unref_r {
+        Poll::Ready(None) => break,
+        Poll::Pending => break,
+        Poll::Ready(Some((op_id, buf))) => {
+          let successful_push = state.shared.push(op_id, &buf);
+          if !successful_push {
+            // If we couldn't push the response to the shared queue, because
+            // there wasn't enough size, we will return the buffer via the
+            // legacy route, using the argument of deno_respond.
+            overflow_response = Some((op_id, buf));
+            break;
+          }
+        }
+      };
+    }
+
+    overflow_response
+  }
+
+  fn check_promise_exceptions(&mut self) -> Result<(), AnyError> {
+    let state_rc = Self::state(self.v8_isolate());
+    let mut state = state_rc.borrow_mut();
+
+    if state.pending_promise_exceptions.is_empty() {
+      return Ok(());
+    }
+
+    let key = { *state.pending_promise_exceptions.keys().next().unwrap() };
+    let handle = state.pending_promise_exceptions.remove(&key).unwrap();
+    drop(state);
+
+    let context = self.global_context();
+    let scope = &mut v8::HandleScope::with_context(self.v8_isolate(), context);
+
+    let exception = v8::Local::new(scope, handle);
+    exception_to_err_result(scope, exception)
+  }
+
+  // Respond using shared queue and optionally overflown response
+  fn async_op_response(
+    &mut self,
+    maybe_overflown_response: Option<(OpId, Box<[u8]>)>,
+  ) -> Result<(), AnyError> {
+    let state_rc = Self::state(self.v8_isolate());
+
+    let shared_queue_size = state_rc.borrow().shared.size();
+
+    if shared_queue_size == 0 && maybe_overflown_response.is_none() {
+      return Ok(());
+    }
+
+    // FIXME(bartlomieju): without check above this call would panic
+    // because of lazy initialization in core.js. It seems this lazy initialization
+    // hides unnecessary complexity.
+    let js_recv_cb_handle = state_rc
+      .borrow()
+      .js_recv_cb
+      .clone()
+      .expect("Deno.core.recv has not been called.");
+
+    let context = self.global_context();
+    let scope = &mut v8::HandleScope::with_context(self.v8_isolate(), context);
+    let context = scope.get_current_context();
+    let global: v8::Local<v8::Value> = context.global(scope).into();
+    let js_recv_cb = js_recv_cb_handle.get(scope);
+
+    let tc_scope = &mut v8::TryCatch::new(scope);
+
+    if shared_queue_size > 0 {
+      js_recv_cb.call(tc_scope, global, &[]);
+      // The other side should have shifted off all the messages.
+      let shared_queue_size = state_rc.borrow().shared.size();
+      assert_eq!(shared_queue_size, 0);
+    }
+
+    if let Some(overflown_response) = maybe_overflown_response {
+      let (op_id, buf) = overflown_response;
+      let op_id: v8::Local<v8::Value> =
+        v8::Integer::new(tc_scope, op_id as i32).into();
+      let ui8: v8::Local<v8::Value> =
+        bindings::boxed_slice_to_uint8array(tc_scope, buf).into();
+      js_recv_cb.call(tc_scope, global, &[op_id, ui8]);
+    }
+
+    match tc_scope.exception() {
+      None => Ok(()),
+      Some(exception) => exception_to_err_result(tc_scope, exception),
+    }
+  }
+
+  fn drain_macrotasks(&mut self) -> Result<(), AnyError> {
+    let js_macrotask_cb_handle =
+      match &Self::state(self.v8_isolate()).borrow().js_macrotask_cb {
+        Some(handle) => handle.clone(),
+        None => return Ok(()),
+      };
+
+    let context = self.global_context();
+    let scope = &mut v8::HandleScope::with_context(self.v8_isolate(), context);
+    let context = scope.get_current_context();
+    let global: v8::Local<v8::Value> = context.global(scope).into();
+    let js_macrotask_cb = js_macrotask_cb_handle.get(scope);
+
+    // Repeatedly invoke macrotask callback until it returns true (done),
+    // such that ready microtasks would be automatically run before
+    // next macrotask is processed.
+    let tc_scope = &mut v8::TryCatch::new(scope);
+
+    loop {
+      let is_done = js_macrotask_cb.call(tc_scope, global, &[]);
+
+      if let Some(exception) = tc_scope.exception() {
+        return exception_to_err_result(tc_scope, exception);
+      }
+
+      let is_done = is_done.unwrap();
+      if is_done.is_true() {
+        break;
+      }
+    }
+
+    Ok(())
   }
 }
 
@@ -1359,16 +1326,18 @@ pub mod tests {
 
     runtime.register_op("test", dispatch);
 
-    js_check(runtime.execute(
-      "setup.js",
-      r#"
+    runtime
+      .execute(
+        "setup.js",
+        r#"
         function assert(cond) {
           if (!cond) {
             throw Error("assert");
           }
         }
         "#,
-    ));
+      )
+      .unwrap();
     assert_eq!(dispatch_count.load(Ordering::Relaxed), 0);
     (runtime, dispatch_count)
   }
@@ -1376,9 +1345,10 @@ pub mod tests {
   #[test]
   fn test_dispatch() {
     let (mut runtime, dispatch_count) = setup(Mode::Async);
-    js_check(runtime.execute(
-      "filename.js",
-      r#"
+    runtime
+      .execute(
+        "filename.js",
+        r#"
         let control = new Uint8Array([42]);
         Deno.core.send(1, control);
         async function main() {
@@ -1386,40 +1356,45 @@ pub mod tests {
         }
         main();
         "#,
-    ));
+      )
+      .unwrap();
     assert_eq!(dispatch_count.load(Ordering::Relaxed), 2);
   }
 
   #[test]
   fn test_dispatch_no_zero_copy_buf() {
     let (mut runtime, dispatch_count) = setup(Mode::AsyncZeroCopy(0));
-    js_check(runtime.execute(
-      "filename.js",
-      r#"
+    runtime
+      .execute(
+        "filename.js",
+        r#"
         Deno.core.send(1);
         "#,
-    ));
+      )
+      .unwrap();
     assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
   }
 
   #[test]
   fn test_dispatch_stack_zero_copy_bufs() {
     let (mut runtime, dispatch_count) = setup(Mode::AsyncZeroCopy(2));
-    js_check(runtime.execute(
-      "filename.js",
-      r#"
+    runtime
+      .execute(
+        "filename.js",
+        r#"
         let zero_copy_a = new Uint8Array([0]);
         let zero_copy_b = new Uint8Array([1]);
         Deno.core.send(1, zero_copy_a, zero_copy_b);
         "#,
-    ));
+      )
+      .unwrap();
     assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
   }
 
   #[test]
   fn test_dispatch_heap_zero_copy_bufs() {
     let (mut runtime, dispatch_count) = setup(Mode::AsyncZeroCopy(5));
-    js_check(runtime.execute(
+    runtime.execute(
       "filename.js",
       r#"
         let zero_copy_a = new Uint8Array([0]);
@@ -1429,7 +1404,7 @@ pub mod tests {
         let zero_copy_e = new Uint8Array([4]);
         Deno.core.send(1, zero_copy_a, zero_copy_b, zero_copy_c, zero_copy_d, zero_copy_e);
         "#,
-    ));
+    ).unwrap();
     assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
   }
 
@@ -1438,39 +1413,45 @@ pub mod tests {
     run_in_task(|cx| {
       let (mut runtime, dispatch_count) = setup(Mode::Async);
 
-      js_check(runtime.execute(
-        "setup2.js",
-        r#"
+      runtime
+        .execute(
+          "setup2.js",
+          r#"
          let nrecv = 0;
          Deno.core.setAsyncHandler(1, (buf) => {
            nrecv++;
          });
          "#,
-      ));
+        )
+        .unwrap();
       assert_eq!(dispatch_count.load(Ordering::Relaxed), 0);
-      js_check(runtime.execute(
-        "check1.js",
-        r#"
+      runtime
+        .execute(
+          "check1.js",
+          r#"
          assert(nrecv == 0);
          let control = new Uint8Array([42]);
          Deno.core.send(1, control);
          assert(nrecv == 0);
          "#,
-      ));
+        )
+        .unwrap();
       assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
       assert!(matches!(runtime.poll_unpin(cx), Poll::Ready(Ok(_))));
       assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
-      js_check(runtime.execute(
-        "check2.js",
-        r#"
+      runtime
+        .execute(
+          "check2.js",
+          r#"
          assert(nrecv == 1);
          Deno.core.send(1, control);
          assert(nrecv == 1);
          "#,
-      ));
+        )
+        .unwrap();
       assert_eq!(dispatch_count.load(Ordering::Relaxed), 2);
       assert!(matches!(runtime.poll_unpin(cx), Poll::Ready(Ok(_))));
-      js_check(runtime.execute("check3.js", "assert(nrecv == 2)"));
+      runtime.execute("check3.js", "assert(nrecv == 2)").unwrap();
       assert_eq!(dispatch_count.load(Ordering::Relaxed), 2);
       // We are idle, so the next poll should be the last.
       assert!(matches!(runtime.poll_unpin(cx), Poll::Ready(Ok(_))));
@@ -1481,9 +1462,10 @@ pub mod tests {
   fn test_poll_async_optional_ops() {
     run_in_task(|cx| {
       let (mut runtime, dispatch_count) = setup(Mode::AsyncUnref);
-      js_check(runtime.execute(
-        "check1.js",
-        r#"
+      runtime
+        .execute(
+          "check1.js",
+          r#"
           Deno.core.setAsyncHandler(1, (buf) => {
             // This handler will never be called
             assert(false);
@@ -1491,7 +1473,8 @@ pub mod tests {
           let control = new Uint8Array([42]);
           Deno.core.send(1, control);
         "#,
-      ));
+        )
+        .unwrap();
       assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
       // The above op never finish, but runtime can finish
       // because the op is an unreffed async op.
@@ -1504,8 +1487,7 @@ pub mod tests {
     let (mut isolate, _dispatch_count) = setup(Mode::Async);
     // TODO(piscisaureus): in rusty_v8, the `thread_safe_handle()` method
     // should not require a mutable reference to `struct rusty_v8::Isolate`.
-    let v8_isolate_handle =
-      isolate.v8_isolate.as_mut().unwrap().thread_safe_handle();
+    let v8_isolate_handle = isolate.v8_isolate().thread_safe_handle();
 
     let terminator_thread = std::thread::spawn(move || {
       // allow deno to boot and run
@@ -1520,7 +1502,7 @@ pub mod tests {
     match isolate.execute("infinite_loop.js", "for(;;) {}") {
       Ok(_) => panic!("execution should be terminated"),
       Err(e) => {
-        assert_eq!(e.to_string(), "Uncaught Error: execution terminated")
+        assert_eq!(e.to_string(), "Uncaught Error: execution terminated\n")
       }
     };
 
@@ -1529,9 +1511,7 @@ pub mod tests {
     // TODO(piscisaureus): in rusty_v8, `cancel_terminate_execution()` should
     // also be implemented on `struct Isolate`.
     let ok = isolate
-      .v8_isolate
-      .as_mut()
-      .unwrap()
+      .v8_isolate()
       .thread_safe_handle()
       .cancel_terminate_execution();
     assert!(ok);
@@ -1551,7 +1531,7 @@ pub mod tests {
       let (mut runtime, _dispatch_count) = setup(Mode::Async);
       // TODO(piscisaureus): in rusty_v8, the `thread_safe_handle()` method
       // should not require a mutable reference to `struct rusty_v8::Isolate`.
-      runtime.v8_isolate.as_mut().unwrap().thread_safe_handle()
+      runtime.v8_isolate().thread_safe_handle()
     };
 
     // this should not SEGFAULT
@@ -1561,9 +1541,10 @@ pub mod tests {
   #[test]
   fn overflow_req_sync() {
     let (mut runtime, dispatch_count) = setup(Mode::OverflowReqSync);
-    js_check(runtime.execute(
-      "overflow_req_sync.js",
-      r#"
+    runtime
+      .execute(
+        "overflow_req_sync.js",
+        r#"
         let asyncRecv = 0;
         Deno.core.setAsyncHandler(1, (buf) => { asyncRecv++ });
         // Large message that will overflow the shared space.
@@ -1574,7 +1555,8 @@ pub mod tests {
         assert(response[0] == 43);
         assert(asyncRecv == 0);
         "#,
-    ));
+      )
+      .unwrap();
     assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
   }
 
@@ -1583,9 +1565,10 @@ pub mod tests {
     // TODO(ry) This test is quite slow due to memcpy-ing 100MB into JS. We
     // should optimize this.
     let (mut runtime, dispatch_count) = setup(Mode::OverflowResSync);
-    js_check(runtime.execute(
-      "overflow_res_sync.js",
-      r#"
+    runtime
+      .execute(
+        "overflow_res_sync.js",
+        r#"
         let asyncRecv = 0;
         Deno.core.setAsyncHandler(1, (buf) => { asyncRecv++ });
         // Large message that will overflow the shared space.
@@ -1596,7 +1579,8 @@ pub mod tests {
         assert(response[0] == 99);
         assert(asyncRecv == 0);
         "#,
-    ));
+      )
+      .unwrap();
     assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
   }
 
@@ -1604,9 +1588,10 @@ pub mod tests {
   fn overflow_req_async() {
     run_in_task(|cx| {
       let (mut runtime, dispatch_count) = setup(Mode::OverflowReqAsync);
-      js_check(runtime.execute(
-        "overflow_req_async.js",
-        r#"
+      runtime
+        .execute(
+          "overflow_req_async.js",
+          r#"
          let asyncRecv = 0;
          Deno.core.setAsyncHandler(1, (buf) => {
            assert(buf.byteLength === 1);
@@ -1620,10 +1605,13 @@ pub mod tests {
          assert(response == null);
          assert(asyncRecv == 0);
          "#,
-      ));
+        )
+        .unwrap();
       assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
       assert!(matches!(runtime.poll_unpin(cx), Poll::Ready(Ok(_))));
-      js_check(runtime.execute("check.js", "assert(asyncRecv == 1);"));
+      runtime
+        .execute("check.js", "assert(asyncRecv == 1);")
+        .unwrap();
     });
   }
 
@@ -1633,9 +1621,10 @@ pub mod tests {
       // TODO(ry) This test is quite slow due to memcpy-ing 100MB into JS. We
       // should optimize this.
       let (mut runtime, dispatch_count) = setup(Mode::OverflowResAsync);
-      js_check(runtime.execute(
-        "overflow_res_async.js",
-        r#"
+      runtime
+        .execute(
+          "overflow_res_async.js",
+          r#"
          let asyncRecv = 0;
          Deno.core.setAsyncHandler(1, (buf) => {
            assert(buf.byteLength === 100 * 1024 * 1024);
@@ -1648,10 +1637,13 @@ pub mod tests {
          assert(response == null);
          assert(asyncRecv == 0);
          "#,
-      ));
+        )
+        .unwrap();
       assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
       poll_until_ready(&mut runtime, 3).unwrap();
-      js_check(runtime.execute("check.js", "assert(asyncRecv == 1);"));
+      runtime
+        .execute("check.js", "assert(asyncRecv == 1);")
+        .unwrap();
     });
   }
 
@@ -1661,9 +1653,10 @@ pub mod tests {
     // should optimize this.
     run_in_task(|_cx| {
       let (mut runtime, dispatch_count) = setup(Mode::OverflowResAsync);
-      js_check(runtime.execute(
-        "overflow_res_multiple_dispatch_async.js",
-        r#"
+      runtime
+        .execute(
+          "overflow_res_multiple_dispatch_async.js",
+          r#"
          let asyncRecv = 0;
          Deno.core.setAsyncHandler(1, (buf) => {
            assert(buf.byteLength === 100 * 1024 * 1024);
@@ -1679,10 +1672,13 @@ pub mod tests {
          // are done even if shared space overflows
          Deno.core.dispatch(1, control);
          "#,
-      ));
+        )
+        .unwrap();
       assert_eq!(dispatch_count.load(Ordering::Relaxed), 2);
       poll_until_ready(&mut runtime, 3).unwrap();
-      js_check(runtime.execute("check.js", "assert(asyncRecv == 2);"));
+      runtime
+        .execute("check.js", "assert(asyncRecv == 2);")
+        .unwrap();
     });
   }
 
@@ -1690,9 +1686,10 @@ pub mod tests {
   fn test_pre_dispatch() {
     run_in_task(|mut cx| {
       let (mut runtime, _dispatch_count) = setup(Mode::OverflowResAsync);
-      js_check(runtime.execute(
-        "bad_op_id.js",
-        r#"
+      runtime
+        .execute(
+          "bad_op_id.js",
+          r#"
           let thrown;
           try {
             Deno.core.dispatch(100);
@@ -1701,7 +1698,8 @@ pub mod tests {
           }
           assert(String(thrown) === "TypeError: Unknown op id: 100");
          "#,
-      ));
+        )
+        .unwrap();
       if let Poll::Ready(Err(_)) = runtime.poll_unpin(&mut cx) {
         unreachable!();
       }
@@ -1712,7 +1710,9 @@ pub mod tests {
   fn core_test_js() {
     run_in_task(|mut cx| {
       let (mut runtime, _dispatch_count) = setup(Mode::Async);
-      js_check(runtime.execute("core_test.js", include_str!("core_test.js")));
+      runtime
+        .execute("core_test.js", include_str!("core_test.js"))
+        .unwrap();
       if let Poll::Ready(Err(_)) = runtime.poll_unpin(&mut cx) {
         unreachable!();
       }
@@ -1733,10 +1733,12 @@ pub mod tests {
   fn test_encode_decode() {
     run_in_task(|mut cx| {
       let (mut runtime, _dispatch_count) = setup(Mode::Async);
-      js_check(runtime.execute(
-        "encode_decode_test.js",
-        include_str!("encode_decode_test.js"),
-      ));
+      runtime
+        .execute(
+          "encode_decode_test.js",
+          include_str!("encode_decode_test.js"),
+        )
+        .unwrap();
       if let Poll::Ready(Err(_)) = runtime.poll_unpin(&mut cx) {
         unreachable!();
       }
@@ -1750,7 +1752,7 @@ pub mod tests {
         will_snapshot: true,
         ..Default::default()
       });
-      js_check(runtime.execute("a.js", "a = 1 + 2"));
+      runtime.execute("a.js", "a = 1 + 2").unwrap();
       runtime.snapshot()
     };
 
@@ -1759,7 +1761,9 @@ pub mod tests {
       startup_snapshot: Some(snapshot),
       ..Default::default()
     });
-    js_check(runtime2.execute("check.js", "if (a != 3) throw Error('x')"));
+    runtime2
+      .execute("check.js", "if (a != 3) throw Error('x')")
+      .unwrap();
   }
 
   #[test]
@@ -1769,7 +1773,7 @@ pub mod tests {
         will_snapshot: true,
         ..Default::default()
       });
-      js_check(runtime.execute("a.js", "a = 1 + 2"));
+      runtime.execute("a.js", "a = 1 + 2").unwrap();
       let snap: &[u8] = &*runtime.snapshot();
       Vec::from(snap).into_boxed_slice()
     };
@@ -1779,7 +1783,9 @@ pub mod tests {
       startup_snapshot: Some(snapshot),
       ..Default::default()
     });
-    js_check(runtime2.execute("check.js", "if (a != 3) throw Error('x')"));
+    runtime2
+      .execute("check.js", "if (a != 3) throw Error('x')")
+      .unwrap();
   }
 
   #[test]
@@ -1792,7 +1798,7 @@ pub mod tests {
       heap_limits: Some(heap_limits),
       ..Default::default()
     });
-    let cb_handle = runtime.thread_safe_handle();
+    let cb_handle = runtime.v8_isolate().thread_safe_handle();
 
     let callback_invoke_count = Rc::new(AtomicUsize::default());
     let inner_invoke_count = Rc::clone(&callback_invoke_count);
@@ -1838,7 +1844,7 @@ pub mod tests {
       heap_limits: Some(heap_limits),
       ..Default::default()
     });
-    let cb_handle = runtime.thread_safe_handle();
+    let cb_handle = runtime.v8_isolate().thread_safe_handle();
 
     let callback_invoke_count_first = Rc::new(AtomicUsize::default());
     let inner_invoke_count_first = Rc::clone(&callback_invoke_count_first);
@@ -1883,6 +1889,7 @@ pub mod tests {
     impl ModuleLoader for ModsLoader {
       fn resolve(
         &self,
+        _op_state: Rc<RefCell<OpState>>,
         specifier: &str,
         referrer: &str,
         _is_main: bool,
@@ -1926,16 +1933,18 @@ pub mod tests {
     });
     runtime.register_op("test", dispatcher);
 
-    js_check(runtime.execute(
-      "setup.js",
-      r#"
+    runtime
+      .execute(
+        "setup.js",
+        r#"
         function assert(cond) {
           if (!cond) {
             throw Error("assert");
           }
         }
         "#,
-    ));
+      )
+      .unwrap();
 
     assert_eq!(dispatch_count.load(Ordering::Relaxed), 0);
 
@@ -1954,7 +1963,7 @@ pub mod tests {
       .unwrap();
     assert_eq!(dispatch_count.load(Ordering::Relaxed), 0);
 
-    let state_rc = JsRuntime::state(&runtime);
+    let state_rc = JsRuntime::state(runtime.v8_isolate());
     {
       let state = state_rc.borrow();
       let imports = state.modules.get_children(mod_a);
@@ -1972,14 +1981,14 @@ pub mod tests {
       assert_eq!(imports.len(), 0);
     }
 
-    js_check(runtime.mod_instantiate(mod_b));
+    runtime.mod_instantiate(mod_b).unwrap();
     assert_eq!(dispatch_count.load(Ordering::Relaxed), 0);
     assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
 
-    js_check(runtime.mod_instantiate(mod_a));
+    runtime.mod_instantiate(mod_a).unwrap();
     assert_eq!(dispatch_count.load(Ordering::Relaxed), 0);
 
-    js_check(runtime.mod_evaluate(mod_a));
+    runtime.mod_evaluate(mod_a).unwrap();
     assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
   }
 
@@ -1993,6 +2002,7 @@ pub mod tests {
     impl ModuleLoader for DynImportErrLoader {
       fn resolve(
         &self,
+        _op_state: Rc<RefCell<OpState>>,
         specifier: &str,
         referrer: &str,
         _is_main: bool,
@@ -2024,14 +2034,16 @@ pub mod tests {
         ..Default::default()
       });
 
-      js_check(runtime.execute(
-        "file:///dyn_import2.js",
-        r#"
+      runtime
+        .execute(
+          "file:///dyn_import2.js",
+          r#"
         (async () => {
           await import("/foo.js");
         })();
         "#,
-      ));
+        )
+        .unwrap();
 
       assert_eq!(count.load(Ordering::Relaxed), 0);
       // We should get an error here.
@@ -2053,6 +2065,7 @@ pub mod tests {
   impl ModuleLoader for DynImportOkLoader {
     fn resolve(
       &self,
+      _op_state: Rc<RefCell<OpState>>,
       specifier: &str,
       referrer: &str,
       _is_main: bool,
@@ -2107,9 +2120,10 @@ pub mod tests {
       });
 
       // Dynamically import mod_b
-      js_check(runtime.execute(
-        "file:///dyn_import3.js",
-        r#"
+      runtime
+        .execute(
+          "file:///dyn_import3.js",
+          r#"
           (async () => {
             let mod = await import("./b.js");
             if (mod.b() !== 'b') {
@@ -2122,7 +2136,8 @@ pub mod tests {
             }
           })();
           "#,
-      ));
+        )
+        .unwrap();
 
       // First poll runs `prepare_load` hook.
       assert!(matches!(runtime.poll_unpin(cx), Poll::Pending));
@@ -2148,9 +2163,10 @@ pub mod tests {
         module_loader: Some(loader),
         ..Default::default()
       });
-      js_check(runtime.execute(
-        "file:///dyn_import3.js",
-        r#"
+      runtime
+        .execute(
+          "file:///dyn_import3.js",
+          r#"
           (async () => {
             let mod = await import("./b.js");
             if (mod.b() !== 'b') {
@@ -2160,7 +2176,8 @@ pub mod tests {
             Deno.core.ops();
           })();
           "#,
-      ));
+        )
+        .unwrap();
       // First poll runs `prepare_load` hook.
       let _ = runtime.poll_unpin(cx);
       assert_eq!(prepare_load_count.load(Ordering::Relaxed), 1);
@@ -2177,6 +2194,7 @@ pub mod tests {
     impl ModuleLoader for ModsLoader {
       fn resolve(
         &self,
+        _op_state: Rc<RefCell<OpState>>,
         specifier: &str,
         referrer: &str,
         _is_main: bool,
@@ -2213,8 +2231,94 @@ pub mod tests {
     )
     .unwrap();
 
-    js_check(runtime.mod_evaluate(module_id));
+    runtime.mod_evaluate(module_id).unwrap();
 
     let _snapshot = runtime.snapshot();
+  }
+
+  #[test]
+  fn test_error_without_stack() {
+    let mut runtime = JsRuntime::new(RuntimeOptions::default());
+    // SyntaxError
+    let result = runtime.execute(
+      "error_without_stack.js",
+      r#"
+function main() {
+  console.log("asdf);
+}
+
+main();
+"#,
+    );
+    let expected_error = r#"Uncaught SyntaxError: Invalid or unexpected token
+    at error_without_stack.js:3:14
+"#;
+    assert_eq!(result.unwrap_err().to_string(), expected_error);
+  }
+
+  #[test]
+  fn test_error_stack() {
+    let mut runtime = JsRuntime::new(RuntimeOptions::default());
+    let result = runtime.execute(
+      "error_stack.js",
+      r#"
+function assert(cond) {
+  if (!cond) {
+    throw Error("assert");
+  }
+}
+
+function main() {
+  assert(false);
+}
+
+main();
+        "#,
+    );
+    let expected_error = r#"Error: assert
+    at assert (error_stack.js:4:11)
+    at main (error_stack.js:9:3)
+    at error_stack.js:12:1
+"#;
+    assert_eq!(result.unwrap_err().to_string(), expected_error);
+  }
+
+  #[test]
+  fn test_error_async_stack() {
+    run_in_task(|cx| {
+      let mut runtime = JsRuntime::new(RuntimeOptions::default());
+      runtime
+        .execute(
+          "error_async_stack.js",
+          r#"
+(async () => {
+  const p = (async () => {
+    await Promise.resolve().then(() => {
+      throw new Error("async");
+    });
+  })();
+
+  try {
+    await p;
+  } catch (error) {
+    console.log(error.stack);
+    throw error;
+  }
+})();"#,
+        )
+        .unwrap();
+      let expected_error = r#"Error: async
+    at error_async_stack.js:5:13
+    at async error_async_stack.js:4:5
+    at async error_async_stack.js:10:5
+"#;
+
+      match runtime.poll_unpin(cx) {
+        Poll::Ready(Err(e)) => {
+          assert_eq!(e.to_string(), expected_error);
+        }
+        _ => panic!(),
+      };
+    })
   }
 }

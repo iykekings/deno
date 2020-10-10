@@ -4,26 +4,26 @@ on: [push, pull_request]
 
 jobs:
   build:
-    name: ${{ matrix.config.kind }} ${{ matrix.config.os }}
+    name: ${{ matrix.kind }} ${{ matrix.os }}
     if: |
       github.event_name == 'push' ||
       !startsWith(github.event.pull_request.head.label, 'denoland:')
-    runs-on: ${{ matrix.config.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       matrix:
-        config:
+        include:
           - os: macos-10.15
             kind: test_release
           - os: windows-2019
             kind: test_release
-          - os: ubuntu-latest-xl
+          - os: ${{ github.repository == 'denoland/deno' && 'ubuntu-latest-xl' || 'ubuntu-18.04' }}
             kind: test_release
-          - os: ubuntu-latest-xl
+          - os: ${{ github.repository == 'denoland/deno' && 'ubuntu-latest-xl' || 'ubuntu-18.04' }}
             kind: test_debug
-          - os: ubuntu-latest-xl
+          - os: ${{ github.repository == 'denoland/deno' && 'ubuntu-latest-xl' || 'ubuntu-18.04' }}
             kind: bench
-          - os: ubuntu-latest-xl
+          - os: ${{ github.repository == 'denoland/deno' && 'ubuntu-latest-xl' || 'ubuntu-18.04' }}
             kind: lint
 
       # Always run master branch builds to completion. This allows the cache to
@@ -31,8 +31,7 @@ jobs:
       # e.g. a flaky test.
       # Don't fast-fail on tag build because publishing binaries shouldn't be
       # prevented if 'cargo publish' fails (which can be a false negative).
-      fail-fast:
-        ${{ github.event_name == 'pull_request' || (github.ref !=
+      fail-fast: ${{ github.event_name == 'pull_request' || (github.ref !=
         'refs/heads/master' && !startsWith(github.ref, 'refs/tags/')) }}
 
     env:
@@ -54,8 +53,8 @@ jobs:
 
       - name: Create source tarballs (release, linux)
         if: |
-          startsWith(matrix.config.os, 'ubuntu') &&
-          matrix.config.kind == 'test_release' &&
+          startsWith(matrix.os, 'ubuntu') &&
+          matrix.kind == 'test_release' &&
           github.repository == 'denoland/deno' &&
           startsWith(github.ref, 'refs/tags/') &&
           !startsWith(github.ref, 'refs/tags/std/')
@@ -66,10 +65,10 @@ jobs:
       - name: Install rust
         uses: hecrj/setup-rust-action@v1
         with:
-          rust-version: 1.46.0
+          rust-version: 1.47.0
 
       - name: Install clippy and rustfmt
-        if: matrix.config.kind == 'lint'
+        if: matrix.kind == 'lint'
         run: |
           rustup component add clippy
           rustup component add rustfmt
@@ -81,7 +80,7 @@ jobs:
           architecture: x64
 
       - name: Remove unused versions of Python
-        if: startsWith(matrix.config.os, 'windows')
+        if: startsWith(matrix.os, 'windows')
         run: |-
           $env:PATH -split ";" |
             Where-Object { Test-Path "$_\python.exe" } |
@@ -115,44 +114,73 @@ jobs:
             target/*/.*
             target/*/build
             target/*/deps
-          key:
-            ${{ matrix.config.os }}-${{ matrix.config.kind }}-${{ hashFiles('Cargo.lock') }}
+            target/*/gn_out
+          key: deno-${{ matrix.os }}-${{ matrix.kind }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ matrix.config.os }}-${{ matrix.config.kind }}-
+            deno-${{ matrix.os }}-${{ matrix.kind }}-
+
+        # It seems that the 'target' directory does not always get restored
+        # from cache correctly on MacOS. In the build log we see the following:
+        #
+        #   Fresh serde_derive v1.0.115
+        #
+        # But a little while after that Cargo aborts because 'serde_derive' is
+        # now nowhere to be found. We're not the only ones experiencing this,
+        # see https://github.com/actions-rs/cargo/issues/111.
+        #
+        #   error[E0463]: can't find crate for `serde_derive`
+        #   ##[error]   --> /Users/runner/.cargo/registry/src/github.com-
+        #       |           1ecc6299db9ec823/serde-1.0.115/src/lib.rs:285:1
+        #       |
+        #   285 | extern crate serde_derive;
+        #       | ^^^^^^^^^^^^^^^^^^^^^^^^^^ can't find crate
+      - name: Work around MacOS + Cargo + Github Actions cache bug
+        if: runner.os == 'macOS'
+        run: |
+          cargo clean --locked --release \
+                      -p ast_node \
+                      -p is-macro \
+                      -p serde_derive \
+                      -p swc_ecma_codegen \
+                      -p swc_ecma_codegen_macros \
+                      -p swc_ecma_parser \
+                      -p swc_ecma_parser_macros \
+                      -p swc_visit \
+                      -p swc_visit_macros
 
       - name: lint.py
-        if: matrix.config.kind == 'lint'
+        if: matrix.kind == 'lint'
         run: python ./tools/lint.py
 
       - name: test_format.py
-        if: matrix.config.kind == 'lint'
+        if: matrix.kind == 'lint'
         run: python ./tools/test_format.py
 
       - name: Build release
         if: |
-          matrix.config.kind == 'test_release' ||
-          matrix.config.kind == 'bench'
-        run: cargo build --release --locked --all-targets
+          matrix.kind == 'test_release' ||
+          matrix.kind == 'bench'
+        run: cargo build --release --locked --all-targets -vv
 
       - name: Build debug
-        if: matrix.config.kind == 'test_debug'
+        if: matrix.kind == 'test_debug'
         run: cargo build --locked --all-targets
 
       - name: Test release
-        if: matrix.config.kind == 'test_release'
+        if: matrix.kind == 'test_release'
         run: cargo test --release --locked --all-targets
 
       - name: Test debug
-        if: matrix.config.kind == 'test_debug'
+        if: matrix.kind == 'test_debug'
         run: cargo test --locked --all-targets
 
       - name: Run Benchmarks
-        if: matrix.config.kind == 'bench'
+        if: matrix.kind == 'bench'
         run: cargo bench
 
       - name: Post Benchmarks
         if: |
-          matrix.config.kind == 'bench' &&
+          matrix.kind == 'bench' &&
           github.repository == 'denoland/deno' &&
           github.ref == 'refs/heads/master'
         env:
@@ -168,15 +196,15 @@ jobs:
           git push origin gh-pages
 
       - name: Worker info
-        if: matrix.config.kind == 'bench'
+        if: matrix.kind == 'bench'
         run: |
           cat /proc/cpuinfo
           cat /proc/meminfo
 
       - name: Pre-release (linux)
         if: |
-          startsWith(matrix.config.os, 'ubuntu') &&
-          matrix.config.kind == 'test_release'
+          startsWith(matrix.os, 'ubuntu') &&
+          matrix.kind == 'test_release'
         run: |
           cd target/release
           zip -r deno-x86_64-unknown-linux-gnu.zip deno
@@ -184,23 +212,23 @@ jobs:
 
       - name: Pre-release (mac)
         if: |
-          startsWith(matrix.config.os, 'macOS') &&
-          matrix.config.kind == 'test_release'
+          startsWith(matrix.os, 'macOS') &&
+          matrix.kind == 'test_release'
         run: |
           cd target/release
           zip -r deno-x86_64-apple-darwin.zip deno
 
       - name: Pre-release (windows)
         if: |
-          startsWith(matrix.config.os, 'windows') &&
-          matrix.config.kind == 'test_release'
+          startsWith(matrix.os, 'windows') &&
+          matrix.kind == 'test_release'
         run: |
           Compress-Archive -CompressionLevel Optimal -Force -Path target/release/deno.exe -DestinationPath target/release/deno-x86_64-pc-windows-msvc.zip
 
       - name: Release
         uses: softprops/action-gh-release@v1
         if: |
-          matrix.config.kind == 'test_release' &&
+          matrix.kind == 'test_release' &&
           github.repository == 'denoland/deno' &&
           startsWith(github.ref, 'refs/tags/') &&
           !startsWith(github.ref, 'refs/tags/std/')
@@ -217,8 +245,8 @@ jobs:
 
       - name: Publish
         if: |
-          startsWith(matrix.config.os, 'ubuntu') &&
-          matrix.config.kind == 'test_release' &&
+          startsWith(matrix.os, 'ubuntu') &&
+          matrix.kind == 'test_release' &&
           github.repository == 'denoland/deno' &&
           startsWith(github.ref, 'refs/tags/') &&
           !startsWith(github.ref, 'refs/tags/std/')

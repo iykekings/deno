@@ -6,8 +6,6 @@
 extern crate lazy_static;
 #[macro_use]
 extern crate log;
-#[macro_use]
-extern crate serde_json;
 
 mod ast;
 mod checksum;
@@ -40,6 +38,7 @@ mod lockfile;
 mod media_type;
 mod metrics;
 mod module_graph;
+mod module_graph2;
 mod op_fetch_asset;
 pub mod ops;
 pub mod permissions;
@@ -47,6 +46,7 @@ mod repl;
 pub mod resolve_addr;
 pub mod signal;
 pub mod source_maps;
+mod specifier_handler;
 pub mod state;
 mod test_runner;
 mod text_encoding;
@@ -55,21 +55,22 @@ mod tsc;
 mod tsc_config;
 mod upgrade;
 pub mod version;
-mod web_worker;
 pub mod worker;
 
 use crate::coverage::CoverageCollector;
 use crate::coverage::PrettyCoverageReporter;
 use crate::file_fetcher::SourceFile;
 use crate::file_fetcher::SourceFileFetcher;
-use crate::file_fetcher::TextDocument;
 use crate::fs as deno_fs;
 use crate::global_state::GlobalState;
 use crate::media_type::MediaType;
 use crate::permissions::Permissions;
 use crate::worker::MainWorker;
 use deno_core::error::AnyError;
-use deno_core::futures;
+use deno_core::futures::future::FutureExt;
+use deno_core::futures::Future;
+use deno_core::serde_json;
+use deno_core::serde_json::json;
 use deno_core::url::Url;
 use deno_core::v8_set_flags;
 use deno_core::ModuleSpecifier;
@@ -77,8 +78,6 @@ use deno_doc as doc;
 use deno_doc::parser::DocFileLoader;
 use flags::DenoSubcommand;
 use flags::Flags;
-use futures::future::FutureExt;
-use futures::Future;
 use global_state::exit_unstable;
 use log::Level;
 use log::LevelFilter;
@@ -119,12 +118,7 @@ impl DocFileLoader for SourceFileFetcher {
             e.to_string(),
           ))
         })?;
-      source_file.source_code.to_string().map_err(|e| {
-        doc::DocError::Io(std::io::Error::new(
-          std::io::ErrorKind::Other,
-          e.to_string(),
-        ))
-      })
+      Ok(source_file.source_code)
     }
     .boxed_local()
   }
@@ -233,7 +227,7 @@ async fn install_command(
 ) -> Result<(), AnyError> {
   let global_state = GlobalState::new(flags.clone())?;
   let main_module = ModuleSpecifier::resolve_url_or_path(&module_url)?;
-  let mut worker = MainWorker::create(&global_state, main_module.clone())?;
+  let mut worker = MainWorker::new(&global_state, main_module.clone());
   // First, fetch and compile the module; this step ensures that the module exists.
   worker.preload_module(&main_module).await?;
   installer::install(flags, &module_url, args, name, root, force)
@@ -265,7 +259,7 @@ async fn cache_command(
   let main_module =
     ModuleSpecifier::resolve_url_or_path("./$deno$cache.ts").unwrap();
   let global_state = GlobalState::new(flags)?;
-  let mut worker = MainWorker::create(&global_state, main_module.clone())?;
+  let mut worker = MainWorker::new(&global_state, main_module.clone());
 
   for file in files {
     let specifier = ModuleSpecifier::resolve_url_or_path(&file)?;
@@ -287,7 +281,7 @@ async fn eval_command(
   let main_module =
     ModuleSpecifier::resolve_url_or_path("./$deno$eval.ts").unwrap();
   let global_state = GlobalState::new(flags)?;
-  let mut worker = MainWorker::create(&global_state, main_module.clone())?;
+  let mut worker = MainWorker::new(&global_state, main_module.clone());
   let main_module_url = main_module.as_url().to_owned();
   // Create a dummy source file.
   let source_code = if print {
@@ -306,7 +300,7 @@ async fn eval_command(
     } else {
       MediaType::JavaScript
     },
-    source_code: TextDocument::new(source_code, Some("utf-8")),
+    source_code: String::from_utf8(source_code)?,
   };
   // Save our fake file into file fetcher cache
   // to allow module access by TS compiler.
@@ -429,18 +423,17 @@ async fn run_repl(flags: Flags) -> Result<(), AnyError> {
   let main_module =
     ModuleSpecifier::resolve_url_or_path("./$deno$repl.ts").unwrap();
   let global_state = GlobalState::new(flags)?;
-  let mut worker = MainWorker::create(&global_state, main_module)?;
-  loop {
-    (&mut *worker).await?;
-  }
+  let mut worker = MainWorker::new(&global_state, main_module.clone());
+  (&mut *worker).await?;
+
+  repl::run(&global_state, worker).await
 }
 
 async fn run_from_stdin(flags: Flags) -> Result<(), AnyError> {
   let global_state = GlobalState::new(flags.clone())?;
   let main_module =
     ModuleSpecifier::resolve_url_or_path("./$deno$stdin.ts").unwrap();
-  let mut worker =
-    MainWorker::create(&global_state.clone(), main_module.clone())?;
+  let mut worker = MainWorker::new(&global_state.clone(), main_module.clone());
 
   let mut source = Vec::new();
   std::io::stdin().read_to_end(&mut source)?;
@@ -451,7 +444,7 @@ async fn run_from_stdin(flags: Flags) -> Result<(), AnyError> {
     url: main_module_url,
     types_header: None,
     media_type: MediaType::TypeScript,
-    source_code: source.into(),
+    source_code: String::from_utf8(source)?,
   };
   // Save our fake file into file fetcher cache
   // to allow module access by TS compiler
@@ -482,12 +475,20 @@ async fn run_with_watch(flags: Flags, script: String) -> Result<(), AnyError> {
   let module_graph = module_graph_loader.get_graph();
 
   // Find all local files in graph
-  let paths_to_watch: Vec<PathBuf> = module_graph
+  let mut paths_to_watch: Vec<PathBuf> = module_graph
     .values()
     .map(|f| Url::parse(&f.url).unwrap())
     .filter(|url| url.scheme() == "file")
     .map(|url| url.to_file_path().unwrap())
     .collect();
+
+  if let Some(import_map) = global_state.flags.import_map_path.clone() {
+    paths_to_watch.push(
+      Url::parse(&format!("file://{}", &import_map))?
+        .to_file_path()
+        .unwrap(),
+    );
+  }
 
   // FIXME(bartlomieju): new file watcher is created on after each restart
   file_watcher::watch_func(&paths_to_watch, move || {
@@ -496,7 +497,7 @@ async fn run_with_watch(flags: Flags, script: String) -> Result<(), AnyError> {
     let gs = GlobalState::new(flags.clone()).unwrap();
     let main_module = main_module.clone();
     async move {
-      let mut worker = MainWorker::create(&gs, main_module.clone())?;
+      let mut worker = MainWorker::new(&gs, main_module.clone());
       debug!("main_module {}", main_module);
       worker.execute_module(&main_module).await?;
       worker.execute("window.dispatchEvent(new Event('load'))")?;
@@ -521,7 +522,7 @@ async fn run_command(flags: Flags, script: String) -> Result<(), AnyError> {
 
   let main_module = ModuleSpecifier::resolve_url_or_path(&script)?;
   let global_state = GlobalState::new(flags.clone())?;
-  let mut worker = MainWorker::create(&global_state, main_module.clone())?;
+  let mut worker = MainWorker::new(&global_state, main_module.clone());
   debug!("main_module {}", main_module);
   worker.execute_module(&main_module).await?;
   worker.execute("window.dispatchEvent(new Event('load'))")?;
@@ -538,7 +539,6 @@ async fn test_command(
   quiet: bool,
   allow_none: bool,
   filter: Option<String>,
-  coverage: bool,
 ) -> Result<(), AnyError> {
   let global_state = GlobalState::new(flags.clone())?;
   let cwd = std::env::current_dir().expect("No current directory");
@@ -561,7 +561,7 @@ async fn test_command(
     return Ok(());
   }
 
-  let test_file_path = cwd.join(".deno.test.ts");
+  let test_file_path = cwd.join("$deno$test.ts");
   let test_file_url =
     Url::from_file_path(&test_file_path).expect("Should be valid file url");
 
@@ -573,23 +573,21 @@ async fn test_command(
       filter,
     )
   } else {
-    let jsdocs = doctest_runner::parse_jsdocs(&test_modules, flags).await?;
+    let jsdocs =
+      doctest_runner::parse_jsdocs(&test_modules, flags.clone()).await?;
     doctest_runner::prepare_doctests(jsdocs, fail_fast, quiet, filter)?
   };
 
   let main_module =
     ModuleSpecifier::resolve_url(&test_file_url.to_string()).unwrap();
-  let mut worker = MainWorker::create(&global_state, main_module.clone())?;
+  let mut worker = MainWorker::new(&global_state, main_module.clone());
   // Create a dummy source file.
   let source_file = SourceFile {
     filename: test_file_url.to_file_path().unwrap(),
     url: test_file_url.clone(),
     types_header: None,
     media_type: MediaType::TypeScript,
-    source_code: TextDocument::new(
-      test_file.clone().into_bytes(),
-      Some("utf-8"),
-    ),
+    source_code: test_file.clone(),
   };
   // Save our fake file into file fetcher cache
   // to allow module access by TS compiler
@@ -597,7 +595,7 @@ async fn test_command(
     .file_fetcher
     .save_source_file_in_cache(&main_module, source_file);
 
-  let mut maybe_coverage_collector = if coverage {
+  let mut maybe_coverage_collector = if flags.coverage {
     let inspector = worker
       .inspector
       .as_mut()
@@ -619,19 +617,16 @@ async fn test_command(
   (&mut *worker).await?;
 
   if let Some(coverage_collector) = maybe_coverage_collector.as_mut() {
-    let script_coverage = coverage_collector.take_precise_coverage().await?;
+    let coverages = coverage_collector.collect().await?;
     coverage_collector.stop_collecting().await?;
 
-    let filtered_coverage = coverage::filter_script_coverages(
-      script_coverage,
-      test_file_url,
-      test_modules,
-    );
+    let filtered_coverages =
+      coverage::filter_script_coverages(coverages, test_file_url, test_modules);
 
-    let pretty_coverage_reporter =
-      PrettyCoverageReporter::new(global_state, filtered_coverage);
-    let report = pretty_coverage_reporter.get_report();
-    print!("{}", report)
+    let mut coverage_reporter = PrettyCoverageReporter::new(quiet);
+    for coverage in filtered_coverages {
+      coverage_reporter.visit_coverage(&coverage);
+    }
   }
 
   Ok(())
@@ -684,9 +679,11 @@ pub fn main() {
       target.push(':');
       target.push_str(&line_no.to_string());
     }
-    if record.level() >= Level::Info {
+    if record.level() <= Level::Info {
+      // Print ERROR, WARN, INFO logs as they are
       writeln!(buf, "{}", record.args())
     } else {
+      // Add prefix to DEBUG or TRACE logs
       writeln!(
         buf,
         "{} RS - {} - {}",
@@ -749,11 +746,10 @@ pub fn main() {
       include,
       allow_none,
       filter,
-      coverage,
-    } => test_command(
-      docs, flags, include, fail_fast, quiet, allow_none, filter, coverage,
-    )
-    .boxed_local(),
+    } => {
+      test_command(docs, flags, include, fail_fast, quiet, allow_none, filter)
+        .boxed_local()
+    }
     DenoSubcommand::Completions { buf } => {
       if let Err(e) = write_to_stdout_ignore_sigpipe(&buf) {
         eprintln!("{}", e);

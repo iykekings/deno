@@ -5,12 +5,12 @@ use crate::import_map::ImportMap;
 use crate::permissions::Permissions;
 use crate::tsc::TargetLib;
 use deno_core::error::AnyError;
+use deno_core::futures::future::FutureExt;
+use deno_core::futures::Future;
 use deno_core::ModuleLoadId;
 use deno_core::ModuleLoader;
 use deno_core::ModuleSpecifier;
 use deno_core::OpState;
-use futures::future::FutureExt;
-use futures::Future;
 use std::cell::RefCell;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -46,10 +46,23 @@ impl CliModuleLoader {
 impl ModuleLoader for CliModuleLoader {
   fn resolve(
     &self,
+    op_state: Rc<RefCell<OpState>>,
     specifier: &str,
     referrer: &str,
     is_main: bool,
   ) -> Result<ModuleSpecifier, AnyError> {
+    let global_state = {
+      let state = op_state.borrow();
+      state.borrow::<Arc<GlobalState>>().clone()
+    };
+
+    // FIXME(bartlomieju): hacky way to provide compatibility with repl
+    let referrer = if referrer.is_empty() && global_state.flags.repl {
+      "<unknown>"
+    } else {
+      referrer
+    };
+
     if !is_main {
       if let Some(import_map) = &self.import_map {
         let result = import_map.resolve(specifier, referrer)?;
@@ -58,6 +71,7 @@ impl ModuleLoader for CliModuleLoader {
         }
       }
     }
+
     let module_specifier =
       ModuleSpecifier::resolve_import(specifier, referrer)?;
 

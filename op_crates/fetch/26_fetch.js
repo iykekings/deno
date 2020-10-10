@@ -869,7 +869,7 @@
       if (this._bodySource instanceof ReadableStream) {
         return bufferFromStream(this._bodySource.getReader(), this.#size);
       }
-      return bodyToArrayBuffer(this._bodySource);
+      return Promise.resolve(bodyToArrayBuffer(this._bodySource));
     }
   }
 
@@ -985,8 +985,9 @@
         this.headers = new Headers(input.headers);
         this.credentials = input.credentials;
         this._stream = input._stream;
-      } else if (typeof input === "string") {
-        this.url = input;
+      } else {
+        // TODO(nayeemrmn): Base from `--location` when implemented and set.
+        this.url = new URL(String(input)).href;
       }
 
       if (init && "method" in init) {

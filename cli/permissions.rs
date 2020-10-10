@@ -593,7 +593,7 @@ impl Permissions {
   pub fn check_hrtime(&self) -> Result<(), AnyError> {
     self
       .hrtime
-      .check("access to high precision time", "--allow-run")
+      .check("access to high precision time", "--allow-hrtime")
   }
 
   #[allow(clippy::too_many_arguments)]
@@ -733,6 +733,7 @@ fn permission_escalation_error() -> AnyError {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use deno_core::serde_json;
 
   // Creates vector of strings, Vec<String>
   macro_rules! svec {

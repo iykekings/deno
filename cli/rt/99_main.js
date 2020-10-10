@@ -1,3 +1,4 @@
+// Copyright 2018-2020 the Deno authors. All rights reserved. MIT license.
 // Removes the `__proto__` for security reasons.  This intentionally makes
 // Deno non compliant with ECMA-262 Annex B.2.2.1
 //
@@ -13,7 +14,6 @@ delete Object.prototype.__proto__;
   const errorStack = window.__bootstrap.errorStack;
   const os = window.__bootstrap.os;
   const timers = window.__bootstrap.timers;
-  const replLoop = window.__bootstrap.repl.replLoop;
   const Console = window.__bootstrap.console.Console;
   const worker = window.__bootstrap.worker;
   const signals = window.__bootstrap.signals;
@@ -293,8 +293,7 @@ delete Object.prototype.__proto__;
       }
     });
 
-    const { args, cwd, noColor, pid, ppid, repl, unstableFlag } =
-      runtimeStart();
+    const { args, cwd, noColor, pid, ppid, unstableFlag } = runtimeStart();
 
     registerErrors();
 
@@ -328,10 +327,6 @@ delete Object.prototype.__proto__;
 
     util.log("cwd", cwd);
     util.log("args", args);
-
-    if (repl) {
-      replLoop();
-    }
   }
 
   function bootstrapWorkerRuntime(name, useDenoNamespace, internalName) {
